@@ -1,27 +1,44 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
+import http.client
 import json
 import os
 import urllib.error
 import urllib.request
+import time
+import uuid
+
+# Endpoint của lớp (opencode.ai) cần User-Agent riêng và session ID ổn định.
+SESSION_ID = os.getenv('OPENCODE_SESSION', str(uuid.uuid4()))
 
 CONFIG = {
-    'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
+    'openai': ('OPENAI_API_KEY', os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1').rstrip('/') + '/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def post_json(url, headers, payload, attempts=6):
+    """Gọi API; lỗi mạng tạm thời (timeout, ngắt kết nối, 429/5xx) thì chờ rồi thử lại tối đa 6 lần (chờ 10s, 20s, 30s, 40s, 50s)."""
+    data = json.dumps(payload).encode()
+    all_headers = {'Content-Type': 'application/json', 'User-Agent': 'K5-ReactLoopAgent-Lab/1.0',
+                   'x-opencode-session': SESSION_ID, **headers}
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, headers=all_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < attempts:
+                time.sleep(10 * attempt)
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+            if attempt < attempts:
+                time.sleep(10 * attempt)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {getattr(exc, "reason", exc)}') from exc
 
 
 class Provider:
